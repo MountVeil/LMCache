@@ -4,6 +4,7 @@ blake3
 aiohttp
 awscrt
 cufile-python
+cryptography
 fastapi
 httpx
 huggingface_hub>=1.5.0

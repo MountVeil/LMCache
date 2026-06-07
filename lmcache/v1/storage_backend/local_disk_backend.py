@@ -25,6 +25,10 @@ from lmcache.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQThreadPoolExecutor,
 )
+from lmcache.v1.storage_backend.local_disk_crypto import (
+    LocalDiskAesGcmCodec,
+    load_local_disk_aes_gcm_key,
+)
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.path_sharder import PathSharder
 
@@ -149,6 +153,15 @@ class LocalDiskBackend(StorageBackendInterface):
         if config.extra_config is not None:
             self.use_odirect = config.extra_config.get("use_odirect", False)
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
+
+        self.crypto = LocalDiskAesGcmCodec(
+            load_local_disk_aes_gcm_key(config.extra_config)
+        )
+        logger.warning(
+            "LocalDiskBackend AES-GCM encryption is enabled without KV block "
+            "identity binding. Valid encrypted KV files can still be swapped "
+            "or replayed by an untrusted storage layer."
+        )
 
         self.disk_worker = LocalDiskWorker(loop)
 
@@ -539,7 +552,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # TODO(Jiayi): need to add ref count in disk memory object
-        self.write_file(buffer, path)
+        self.write_file(key, buffer, path)
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
@@ -581,7 +594,8 @@ class LocalDiskBackend(StorageBackendInterface):
         # TODO (Jiayi): handle the case where loading fails.
         for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             buffer = mem_obj.byte_array
-            self.read_file(key, buffer, path)
+            if not self.read_file(key, buffer, path):
+                continue
 
             # TODO(Jiayi): Please recover the metadata in a more
             # elegant way in the future.
@@ -610,7 +624,8 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        self.read_file(key, buffer, path)
+        if not self.read_file(key, buffer, path):
+            return None
 
         # TODO(Jiayi): Please recover the metadata in a more
         # elegant way in the future.
@@ -619,15 +634,16 @@ class LocalDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
-    def write_file(self, buffer, path):
+    def write_file(self, key, buffer, path):
         start_time = time.time()
-        size = len(buffer)
+        stored_bytes = self.crypto.encrypt(key, bytes(buffer))
+        size = len(stored_bytes)
         if size % self.os_disk_bs != 0 or not self.use_odirect:
             with open(path, "wb") as f:
-                f.write(buffer)
+                f.write(stored_bytes)
         else:
             fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
-            os.write(fd, buffer)
+            os.write(fd, stored_bytes)
             os.close(fd)
         disk_write_time = time.time() - start_time
         logger.debug(
@@ -638,7 +654,7 @@ class LocalDiskBackend(StorageBackendInterface):
     @_lmcache_nvtx_annotate
     def read_file(self, key, buffer, path):
         start_time = time.time()
-        size = len(buffer)
+        size = os.path.getsize(path) if os.path.exists(path) else 0
         fblock_aligned = size % self.os_disk_bs == 0
         if not fblock_aligned and self.use_odirect:
             logger.warning(
@@ -649,22 +665,42 @@ class LocalDiskBackend(StorageBackendInterface):
         try:
             if not fblock_aligned or not self.use_odirect:
                 with open(path, "rb") as f:
-                    f.readinto(buffer)
+                    stored_bytes = f.read()
             else:
                 fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
                 with os.fdopen(fd, "rb", buffering=0) as fdo:
-                    fdo.readinto(buffer)
+                    stored_bytes = fdo.read()
         except FileNotFoundError:
             logger.warning(f"File not found on disk: {path}")
             if self.dict.get(key, None):
                 self.dict.pop(key)
-            return
+            return False
+
+        try:
+            plaintext = self.crypto.decrypt(key, stored_bytes)
+        except Exception as e:
+            logger.warning("Failed to decrypt local disk KV for %s: %s", key, e)
+            if self.dict.get(key, None):
+                self.dict.pop(key)
+            return False
+
+        if len(plaintext) != len(buffer):
+            logger.warning(
+                "Decrypted KV size mismatch for %s: expected %d bytes, got %d",
+                key,
+                len(buffer),
+                len(plaintext),
+            )
+            return False
+
+        buffer[:] = plaintext
 
         disk_read_time = time.time() - start_time
         logger.debug(
-            f"Disk read size: {size} bytes, "
-            f"Bandwidth: {size / disk_read_time / 1e6:.2f} MB/s"
+            f"Disk read size: {len(stored_bytes)} bytes, "
+            f"Bandwidth: {len(stored_bytes) / disk_read_time / 1e6:.2f} MB/s"
         )
+        return True
 
     def get_allocator_backend(self) -> LocalCPUBackend:
         return self.local_cpu_backend
