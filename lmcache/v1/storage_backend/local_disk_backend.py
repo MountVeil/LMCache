@@ -27,6 +27,7 @@ from lmcache.v1.storage_backend.job_executor.pq_executor import (
 )
 from lmcache.v1.storage_backend.local_disk_crypto import (
     LocalDiskAesGcmCodec,
+    build_local_disk_kv_identity_aad,
     load_local_disk_aes_gcm_key,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -158,9 +159,9 @@ class LocalDiskBackend(StorageBackendInterface):
             load_local_disk_aes_gcm_key(config.extra_config)
         )
         logger.warning(
-            "LocalDiskBackend AES-GCM encryption is enabled without KV block "
-            "identity binding. Valid encrypted KV files can still be swapped "
-            "or replayed by an untrusted storage layer."
+            "LocalDiskBackend AES-GCM encryption is enabled with KV block "
+            "identity binding. Ciphertexts are authenticated against their "
+            "cache key, shape, dtype, format, and cached positions."
         )
 
         self.disk_worker = LocalDiskWorker(loop)
@@ -551,8 +552,14 @@ class LocalDiskBackend(StorageBackendInterface):
         self.usage += size
         self.stats_monitor.update_local_storage_usage(self.usage)
 
+        size = memory_obj.get_physical_size()
+        shape = memory_obj.metadata.shape
+        dtype = memory_obj.metadata.dtype
+        fmt = memory_obj.metadata.fmt
+        cached_positions = memory_obj.metadata.cached_positions
+
         # TODO(Jiayi): need to add ref count in disk memory object
-        self.write_file(key, buffer, path)
+        self.write_file(key, buffer, path, shape, dtype, fmt, cached_positions)
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
@@ -560,11 +567,6 @@ class LocalDiskBackend(StorageBackendInterface):
         # purposes (e.g., testing mem_leak).
         # TODO(Jiayi): This could be problematic if the
         # freed memory object is immediately reused.
-        size = memory_obj.get_physical_size()
-        shape = memory_obj.metadata.shape
-        dtype = memory_obj.metadata.dtype
-        fmt = memory_obj.metadata.fmt
-        cached_positions = memory_obj.metadata.cached_positions
         memory_obj.ref_count_down()
 
         self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
@@ -594,7 +596,19 @@ class LocalDiskBackend(StorageBackendInterface):
         # TODO (Jiayi): handle the case where loading fails.
         for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             buffer = mem_obj.byte_array
-            if not self.read_file(key, buffer, path):
+            disk_meta = self.dict[key]
+            assert disk_meta.dtype is not None
+            assert disk_meta.shape is not None
+            assert disk_meta.fmt is not None
+            if not self.read_file(
+                key,
+                buffer,
+                path,
+                disk_meta.shape,
+                disk_meta.dtype,
+                disk_meta.fmt,
+                disk_meta.cached_positions,
+            ):
                 continue
 
             # TODO(Jiayi): Please recover the metadata in a more
@@ -624,19 +638,26 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        if not self.read_file(key, buffer, path):
+        cached_positions = self.dict[key].cached_positions
+        if not self.read_file(key, buffer, path, shape, dtype, fmt, cached_positions):
             return None
 
         # TODO(Jiayi): Please recover the metadata in a more
         # elegant way in the future.
-        cached_positions = self.dict[key].cached_positions
         memory_obj.metadata.cached_positions = cached_positions
 
         return memory_obj
 
-    def write_file(self, key, buffer, path):
+    def write_file(self, key, buffer, path, shape, dtype, fmt, cached_positions):
         start_time = time.time()
-        stored_bytes = self.crypto.encrypt(key, bytes(buffer))
+        aad = build_local_disk_kv_identity_aad(
+            key,
+            shape,
+            dtype,
+            fmt,
+            cached_positions,
+        )
+        stored_bytes = self.crypto.encrypt(key, bytes(buffer), aad=aad)
         size = len(stored_bytes)
         if size % self.os_disk_bs != 0 or not self.use_odirect:
             with open(path, "wb") as f:
@@ -652,7 +673,7 @@ class LocalDiskBackend(StorageBackendInterface):
         )
 
     @_lmcache_nvtx_annotate
-    def read_file(self, key, buffer, path):
+    def read_file(self, key, buffer, path, shape, dtype, fmt, cached_positions):
         start_time = time.time()
         size = os.path.getsize(path) if os.path.exists(path) else 0
         fblock_aligned = size % self.os_disk_bs == 0
@@ -677,7 +698,14 @@ class LocalDiskBackend(StorageBackendInterface):
             return False
 
         try:
-            plaintext = self.crypto.decrypt(key, stored_bytes)
+            aad = build_local_disk_kv_identity_aad(
+                key,
+                shape,
+                dtype,
+                fmt,
+                cached_positions,
+            )
+            plaintext = self.crypto.decrypt(key, stored_bytes, aad=aad)
         except Exception as e:
             logger.warning("Failed to decrypt local disk KV for %s: %s", key, e)
             if self.dict.get(key, None):
