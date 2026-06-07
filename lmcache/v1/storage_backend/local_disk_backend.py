@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import hashlib
 import os
 import threading
 import time
@@ -25,10 +27,10 @@ from lmcache.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQThreadPoolExecutor,
 )
-from lmcache.v1.storage_backend.local_disk_crypto import (
-    LocalDiskAesGcmCodec,
-    build_local_disk_kv_identity_aad,
-    load_local_disk_aes_gcm_key,
+from lmcache_secure.capsule import KvObjectMetadata
+from lmcache_secure.trusted_state_manager import (
+    KvSecurityFailure,
+    MockTrustedStateManager,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.path_sharder import PathSharder
@@ -155,13 +157,19 @@ class LocalDiskBackend(StorageBackendInterface):
             self.use_odirect = config.extra_config.get("use_odirect", False)
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
 
-        self.crypto = LocalDiskAesGcmCodec(
-            load_local_disk_aes_gcm_key(config.extra_config)
+        self.trusted_state_manager = MockTrustedStateManager.from_config(
+            config.extra_config
         )
+        self.secure_session_id = "default-session"
+        if config.extra_config is not None:
+            self.secure_session_id = str(
+                config.extra_config.get("secure_kv_session_id", self.secure_session_id)
+            )
         logger.warning(
-            "LocalDiskBackend AES-GCM encryption is enabled with KV block "
-            "identity binding. Ciphertexts are authenticated against their "
-            "cache key, shape, dtype, format, and cached positions."
+            "LocalDiskBackend secure KV capsules are enabled. The untrusted "
+            "disk backend stores only sealed bytes; key derivation, nonce "
+            "derivation, version checks, and manifest checks are delegated to "
+            "MockTrustedStateManager."
         )
 
         self.disk_worker = LocalDiskWorker(loop)
@@ -319,6 +327,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        secure_metadata: Optional[KvObjectMetadata] = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ):
         """
@@ -368,6 +377,17 @@ class LocalDiskBackend(StorageBackendInterface):
         if not evict_success:
             return None
 
+        if secure_metadata is None:
+            secure_metadata = self._secure_metadata_for_write(key, memory_obj)
+            plaintext_digest = self.trusted_state_manager.digest_plaintext(
+                bytes(memory_obj.byte_array)
+            )
+            self.trusted_state_manager.register_manifest(
+                self.secure_session_id,
+                self._manifest_request_id([key]),
+                [(secure_metadata, plaintext_digest)],
+            )
+
         memory_obj.ref_count_up()
 
         asyncio.run_coroutine_threadsafe(
@@ -376,6 +396,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.async_save_bytes_to_disk,
                 key=key,
                 memory_obj=memory_obj,
+                secure_metadata=secure_metadata,
                 on_complete_callback=on_complete_callback,
             ),
             self.loop,
@@ -399,10 +420,34 @@ class LocalDiskBackend(StorageBackendInterface):
             after that key's disk write completes (not once per batch).
             Callback exceptions are caught and logged.
         """
+        manifest_entries: list[tuple[KvObjectMetadata, str]] = []
         for key, memory_obj in zip(keys, memory_objs, strict=False):
-            self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
+            secure_metadata = self._secure_metadata_for_write(key, memory_obj)
+            manifest_entries.append(
+                (
+                    secure_metadata,
+                    self.trusted_state_manager.digest_plaintext(
+                        bytes(memory_obj.byte_array)
+                    ),
+                )
             )
+            self.trusted_state_manager.register_manifest(
+                self.secure_session_id,
+                self._manifest_request_id([key]),
+                [manifest_entries[-1]],
+            )
+            self.submit_put_task(
+                key,
+                memory_obj,
+                secure_metadata=secure_metadata,
+                on_complete_callback=on_complete_callback,
+            )
+
+        self.trusted_state_manager.register_manifest(
+            self.secure_session_id,
+            self._manifest_request_id(keys),
+            manifest_entries,
+        )
 
     def get_blocking(
         self,
@@ -534,6 +579,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        secure_metadata: Optional[KvObjectMetadata] = None,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         """
@@ -557,9 +603,11 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
         cached_positions = memory_obj.metadata.cached_positions
+        if secure_metadata is None:
+            secure_metadata = self._secure_metadata_for_write(key, memory_obj)
 
         # TODO(Jiayi): need to add ref count in disk memory object
-        self.write_file(key, buffer, path, shape, dtype, fmt, cached_positions)
+        self.write_file(key, buffer, path, secure_metadata)
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
@@ -594,12 +642,21 @@ class LocalDiskBackend(StorageBackendInterface):
 
         logger.debug("Executing `async_load_bytes` from disk.")
         # TODO (Jiayi): handle the case where loading fails.
+        loaded_entries: list[tuple[KvObjectMetadata, str]] = []
+        loaded_memory_objs: list[MemoryObj] = []
         for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
             buffer = mem_obj.byte_array
             disk_meta = self.dict[key]
             assert disk_meta.dtype is not None
             assert disk_meta.shape is not None
             assert disk_meta.fmt is not None
+            expected_metadata = self._secure_metadata_for_read(
+                key,
+                disk_meta.shape,
+                disk_meta.dtype,
+                disk_meta.fmt,
+                disk_meta.cached_positions,
+            )
             if not self.read_file(
                 key,
                 buffer,
@@ -615,12 +672,33 @@ class LocalDiskBackend(StorageBackendInterface):
             # elegant way in the future.
             cached_positions = self.dict[key].cached_positions
             mem_obj.metadata.cached_positions = cached_positions
+            loaded_entries.append(
+                (
+                    expected_metadata,
+                    self.trusted_state_manager.digest_plaintext(bytes(buffer)),
+                )
+            )
+            loaded_memory_objs.append(mem_obj)
 
             self.disk_lock.acquire()
             self.dict[key].unpin()
             self.disk_lock.release()
 
-        return memory_objs
+        if len(loaded_entries) != len(keys):
+            logger.warning("Secure KV manifest check failed: missing chunk in batch")
+            return []
+
+        try:
+            self.trusted_state_manager.verify_before_restore(
+                self.secure_session_id,
+                self._manifest_request_id(keys),
+                loaded_entries,
+            )
+        except KvSecurityFailure as e:
+            logger.warning("Secure KV manifest check failed for batch: %s", e)
+            return []
+
+        return loaded_memory_objs
 
     def load_bytes_from_disk(
         self,
@@ -648,16 +726,12 @@ class LocalDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
-    def write_file(self, key, buffer, path, shape, dtype, fmt, cached_positions):
+    def write_file(self, key, buffer, path, secure_metadata: KvObjectMetadata):
         start_time = time.time()
-        aad = build_local_disk_kv_identity_aad(
-            key,
-            shape,
-            dtype,
-            fmt,
-            cached_positions,
+        stored_bytes = self.trusted_state_manager.seal_kv_object(
+            secure_metadata,
+            bytes(buffer),
         )
-        stored_bytes = self.crypto.encrypt(key, bytes(buffer), aad=aad)
         size = len(stored_bytes)
         if size % self.os_disk_bs != 0 or not self.use_odirect:
             with open(path, "wb") as f:
@@ -698,16 +772,30 @@ class LocalDiskBackend(StorageBackendInterface):
             return False
 
         try:
-            aad = build_local_disk_kv_identity_aad(
+            expected_metadata = self._secure_metadata_for_read(
                 key,
                 shape,
                 dtype,
                 fmt,
                 cached_positions,
             )
-            plaintext = self.crypto.decrypt(key, stored_bytes, aad=aad)
+            plaintext = self.trusted_state_manager.open_kv_object(
+                expected_metadata,
+                stored_bytes,
+            )
+            plaintext_digest = self.trusted_state_manager.digest_plaintext(plaintext)
+            self.trusted_state_manager.verify_before_restore(
+                self.secure_session_id,
+                self._manifest_request_id([key]),
+                [(expected_metadata, plaintext_digest)],
+            )
+        except KvSecurityFailure as e:
+            logger.warning("Secure KV validation failed for %s: %s", key, e)
+            if self.dict.get(key, None):
+                self.dict.pop(key)
+            return False
         except Exception as e:
-            logger.warning("Failed to decrypt local disk KV for %s: %s", key, e)
+            logger.warning("Failed to open secure local disk KV for %s: %s", key, e)
             if self.dict.get(key, None):
                 self.dict.pop(key)
             return False
@@ -732,6 +820,56 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def get_allocator_backend(self) -> LocalCPUBackend:
         return self.local_cpu_backend
+
+    def _secure_metadata_for_write(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+    ) -> KvObjectMetadata:
+        base_metadata = KvObjectMetadata.from_lmcache(
+            key=key,
+            shape=memory_obj.metadata.shape,
+            dtype=memory_obj.metadata.dtype,
+            fmt=memory_obj.metadata.fmt,
+            version=0,
+            cached_positions=memory_obj.metadata.cached_positions,
+            session_id=self.secure_session_id,
+            direction="store",
+        )
+        return replace(
+            base_metadata,
+            version=self.trusted_state_manager.next_version(base_metadata),
+        )
+
+    def _secure_metadata_for_read(
+        self,
+        key: CacheEngineKey,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: MemoryFormat,
+        cached_positions: Optional[torch.Tensor],
+    ) -> KvObjectMetadata:
+        base_metadata = KvObjectMetadata.from_lmcache(
+            key=key,
+            shape=shape,
+            dtype=dtype,
+            fmt=fmt,
+            version=0,
+            cached_positions=cached_positions,
+            session_id=self.secure_session_id,
+            direction="store",
+        )
+        return replace(
+            base_metadata,
+            version=self.trusted_state_manager.current_version(base_metadata.cache_key),
+        )
+
+    def _manifest_request_id(self, keys: Sequence[CacheEngineKey]) -> str:
+        digest = hashlib.sha256()
+        for key in keys:
+            digest.update(key.to_string().encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
 
     def close(self) -> None:
         if self.batched_msg_sender is not None:

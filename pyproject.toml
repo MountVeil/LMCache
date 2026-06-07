@@ -62,7 +62,7 @@ git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v[0-9
 
 [tool.setuptools.packages.find]
 where = [""]
-include = ["lmcache", "lmcache*"]
+include = ["lmcache", "lmcache*", "lmcache_secure", "lmcache_secure*"]
 
 [tool.ruff]
 # same as Black's default line length
