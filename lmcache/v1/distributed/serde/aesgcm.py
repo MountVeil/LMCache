@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# Modified for the ConfKV research prototype.
+# Based on LMCache; see LICENSE, THIRD_PARTY.md, and MODIFICATIONS.md.
 """AES-GCM encryption serde for L2-at-rest confidentiality.
 
 Encrypts KV cache bytes on store (L1->L2) and decrypts on load (L2->L1),
@@ -170,10 +172,49 @@ def _create_aesgcm_serde(kwargs: dict[str, object]) -> SerdeProcessor:
         )
 
     max_workers = int(kwargs.get("max_workers", 1))  # type: ignore[call-overload]
-    return AsyncSerdeProcessor(
-        AesGcmSerializer(provider),
-        AesGcmDeserializer(provider),
-        max_workers=max_workers,
+
+    # Select the CPU AES-GCM implementation without changing the LMCache
+    # serde configuration or persistent wire format.
+    #
+    #   LMCACHE_AESGCM_BACKEND=stock   -> original LMCache implementation
+    #   LMCACHE_AESGCM_BACKEND=native  -> direct-buffer OpenSSL backend
+    #
+    # Default is stock so existing LMCache behavior is preserved.
+    backend = os.getenv(
+        "LMCACHE_AESGCM_BACKEND",
+        "stock",
+    ).strip().lower()
+
+    if backend in ("stock", "original", "python", "cryptography"):
+        logger.info("AES-GCM serde backend: stock")
+
+        return AsyncSerdeProcessor(
+            AesGcmSerializer(provider),
+            AesGcmDeserializer(provider),
+            max_workers=max_workers,
+        )
+
+    if backend in ("native", "optimized", "optcpu", "openssl"):
+        if aes_bits != 128:
+            raise ValueError(
+                "native AES-GCM backend currently supports "
+                "aes_bits=128 only"
+            )
+
+        from lmcache.v1.distributed.serde.native_aesgcm import (
+            create_native_aesgcm_processor,
+        )
+
+        logger.info("AES-GCM serde backend: native")
+
+        return create_native_aesgcm_processor(
+            provider,
+            max_workers=max_workers,
+        )
+
+    raise ValueError(
+        "Unknown LMCACHE_AESGCM_BACKEND="
+        f"{backend!r}; expected 'stock' or 'native'"
     )
 
 
