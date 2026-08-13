@@ -12,6 +12,7 @@ import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.confkv.gpu_crypto import validate_confkv_l2_adapter_config
 from lmcache.native_storage_ops import Bitmap, PeriodicEventNotifier
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
@@ -1088,6 +1089,12 @@ class StorageManager:
             the freshly allocated stable id, ``adapter`` is the new adapter
             instance, and ``descriptor`` is its descriptor carrying that id.
         """
+        # ConfKV B3 has already produced the final P+29
+        # persistent representation before the object reaches
+        # the L2 stack. Reject any serde wrapper before an
+        # adapter is constructed.
+        validate_confkv_l2_adapter_config(config)
+
         adapter_id = self._next_adapter_id
         self._next_adapter_id += 1
         adapter: L2AdapterInterface = create_l2_adapter(config, self._l1_memory_desc)

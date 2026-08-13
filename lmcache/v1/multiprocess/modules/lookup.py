@@ -9,6 +9,7 @@ import time
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.confkv.gpu_crypto import persistent_layout_descs
 from lmcache.v1.distributed.api import (
     DEFAULT_ATTN_WINDOW_DESC,
     AttnWindowDesc,
@@ -315,6 +316,11 @@ class LookupModule:
                 )
             )
             return
+
+        # In B3 the persistent object in L1/L2 is the exact sealed P+29
+        # frame. The prefetch controller uses these descriptors when it
+        # reserve_write()s destination buffers for L2 load.
+        group_layout_descs = persistent_layout_descs(group_layout_descs)
 
         handle = self._ctx.storage_manager.submit_prefetch_task(
             PrefetchRequestSpec(
