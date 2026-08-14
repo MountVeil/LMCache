@@ -34,8 +34,8 @@ _FRAME_OVERHEAD = _HDR_LEN + _TAG_LEN
 
 def _default_lib_path() -> Path:
     # .../LMCache/lmcache/v1/distributed/serde/native_aesgcm.py
-    # parents[4] == repository root
-    repo_root = Path(__file__).resolve().parents[4]
+    # parents[5] == ConfKV repository root
+    repo_root = Path(__file__).resolve().parents[5]
 
     return (
         repo_root

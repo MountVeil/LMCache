@@ -425,6 +425,12 @@ def transfer_kv_per_object_group(
     direction: "lmc_ops.TransferDirection",
     d2h_transform: Callable[[torch.Tensor, MemoryObj], None] | None = None,
     h2d_transform: Callable[[MemoryObj, torch.Tensor], None] | None = None,
+    d2h_batch_transform: Callable[
+        [Sequence[torch.Tensor], Sequence[MemoryObj]], None
+    ] | None = None,
+    h2d_batch_transform: Callable[
+        [Sequence[MemoryObj], Sequence[torch.Tensor]], None
+    ] | None = None,
 ) -> None:
     """Helper function to transfer memory objects of a single object group
     to/from GPU, with batching support.
@@ -452,24 +458,58 @@ def transfer_kv_per_object_group(
         This function expects the caller to stage the block ids (list[list[int]])
         into GPU tensors and pass them in as `block_ids_gpu`.
     """
-    if d2h_transform is not None and h2d_transform is not None:
-        raise ValueError("Only one ConfKV transfer transform may be active")
     if (
         d2h_transform is not None
-        and direction == lmc_ops.TransferDirection.H2D
+        and d2h_batch_transform is not None
     ):
-        raise ValueError("d2h_transform is valid only for D2H store transfers")
+        raise ValueError(
+            "Only one D2H ConfKV transform may be active"
+        )
+
     if (
         h2d_transform is not None
-        and direction == lmc_ops.TransferDirection.D2H
+        and h2d_batch_transform is not None
     ):
-        raise ValueError("h2d_transform is valid only for H2D retrieve transfers")
+        raise ValueError(
+            "Only one H2D ConfKV transform may be active"
+        )
 
+    if (
+        d2h_transform is not None
+        and h2d_transform is not None
+    ):
+        raise ValueError(
+            "Only one ConfKV transfer transform may be active"
+        )
+
+    if (
+        direction == lmc_ops.TransferDirection.H2D
+        and (
+            d2h_transform is not None
+            or d2h_batch_transform is not None
+        )
+    ):
+        raise ValueError(
+            "D2H transform is valid only for store transfers"
+        )
+
+    if (
+        direction == lmc_ops.TransferDirection.D2H
+        and (
+            h2d_transform is not None
+            or h2d_batch_transform is not None
+        )
+    ):
+        raise ValueError(
+            "H2D transform is valid only for retrieve transfers"
+        )
     # Native transfer fuses host copy and paged-KV staging/scatter. B3
     # needs an explicit crypto boundary between those operations.
     if (
         d2h_transform is None
         and h2d_transform is None
+        and d2h_batch_transform is None
+        and h2d_batch_transform is None
         and _HAS_NATIVE_OBJECT_GROUP_TRANSFER
         and not any(isinstance(mo, GDSMemoryObject) for mo in memory_objs)
     ):
@@ -502,9 +542,51 @@ def transfer_kv_per_object_group(
             num_objects_to_skip,
         )
 
-    for start_object_idx, memory_object_batch in batched_iteration_with_skip(
-        memory_objs, batch_size, skip_count=num_objects_to_skip
-    ):
+    def _iter_transfer_batches():
+        if (
+            not is_h2d
+            and d2h_batch_transform is not None
+        ):
+            # Store reservations may be sparse. Build batches only from
+            # contiguous runs of actually reserved objects, preserving each
+            # chunk's original object index / block-ID range.
+            idx = 0
+            total = len(memory_objs)
+
+            while idx < total:
+                while (
+                    idx < total
+                    and memory_objs[idx] is None
+                ):
+                    idx += 1
+
+                if idx >= total:
+                    break
+
+                run_start = idx
+
+                while (
+                    idx < total
+                    and memory_objs[idx] is not None
+                    and idx - run_start < batch_size
+                ):
+                    idx += 1
+
+                yield (
+                    run_start,
+                    memory_objs[run_start:idx],
+                )
+        else:
+            yield from batched_iteration_with_skip(
+                memory_objs,
+                batch_size,
+                skip_count=num_objects_to_skip,
+            )
+
+    for (
+        start_object_idx,
+        memory_object_batch,
+    ) in _iter_transfer_batches():
         if any(mo is None for mo in memory_object_batch):
             if is_h2d:
                 raise ValueError(
@@ -525,19 +607,41 @@ def transfer_kv_per_object_group(
 
         skip_tokens_in_chunk = effective_start - batch_start_token
 
-        # For H2D, B0/B1/B2 keep the original plaintext copy. B3 copies
-        # sealed P+29, authenticates/opens on GPU, and returns only after
-        # authentication succeeds. The scatter kernels below therefore
-        # cannot be enqueued for an unauthenticated chunk.
+        # For H2D, B0/B1/B2 retain the original behavior. B3 can open the
+        # entire LMCache batch concurrently before any scatter is enqueued.
         if is_h2d:
-            for chunk_idx, memory_obj in enumerate(memory_object_batch):
-                gpu_buffer = cache_context.get_temp_object_group_buffer(
-                    chunk_idx, object_group_id
+            gpu_buffers = [
+                cache_context.get_temp_object_group_buffer(
+                    chunk_idx,
+                    object_group_id,
                 )
-                if h2d_transform is None:
-                    lmcache_memcpy_async_h2d(memory_obj, gpu_buffer)
-                else:
-                    h2d_transform(memory_obj, gpu_buffer)
+                for chunk_idx in range(batch_len)
+            ]
+
+            if h2d_batch_transform is not None:
+                h2d_batch_transform(
+                    memory_object_batch,
+                    gpu_buffers,
+                )
+            else:
+                for (
+                    memory_obj,
+                    gpu_buffer,
+                ) in zip(
+                    memory_object_batch,
+                    gpu_buffers,
+                    strict=True,
+                ):
+                    if h2d_transform is None:
+                        lmcache_memcpy_async_h2d(
+                            memory_obj,
+                            gpu_buffer,
+                        )
+                    else:
+                        h2d_transform(
+                            memory_obj,
+                            gpu_buffer,
+                        )
 
         # Do paged KV copy
         for kernel_group_id in kernel_group_ids:
@@ -595,19 +699,47 @@ def transfer_kv_per_object_group(
                 recalculated_skip_blocks,
             )
 
-        # For D2H, B0/B1/B2 keep the original plaintext copy. B3 invokes
-        # a GPU transform after gather and before any host copy.
+        # For D2H, B3 receives every gathered plaintext staging buffer at
+        # once, allowing AES-GCM and D2H to fan out across crypto slots.
         if not is_h2d:
-            for chunk_idx, memory_obj in enumerate(memory_object_batch):
-                if memory_obj is None:
-                    raise AssertionError("None MemoryObj escaped the D2H batch guard")
-                gpu_buffer = cache_context.get_temp_object_group_buffer(
-                    chunk_idx, object_group_id
+            gpu_buffers = [
+                cache_context.get_temp_object_group_buffer(
+                    chunk_idx,
+                    object_group_id,
                 )
-                if d2h_transform is None:
-                    lmcache_memcpy_async_d2h(gpu_buffer, memory_obj)
-                else:
-                    d2h_transform(gpu_buffer, memory_obj)
+                for chunk_idx in range(batch_len)
+            ]
+
+            if d2h_batch_transform is not None:
+                d2h_batch_transform(
+                    gpu_buffers,
+                    memory_object_batch,
+                )
+            else:
+                for (
+                    gpu_buffer,
+                    memory_obj,
+                ) in zip(
+                    gpu_buffers,
+                    memory_object_batch,
+                    strict=True,
+                ):
+                    if memory_obj is None:
+                        raise AssertionError(
+                            "None MemoryObj escaped "
+                            "the D2H batch guard"
+                        )
+
+                    if d2h_transform is None:
+                        lmcache_memcpy_async_d2h(
+                            gpu_buffer,
+                            memory_obj,
+                        )
+                    else:
+                        d2h_transform(
+                            gpu_buffer,
+                            memory_obj,
+                        )
 
 
 @dataclass
@@ -669,6 +801,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         self._device_host_func_dispatcher.register(
             "finish_write",
             self._ctx.storage_manager.finish_write,
+            payload_type=list[ObjectKey],
+        )
+        self._device_host_func_dispatcher.register(
+            "abort_write",
+            self._ctx.storage_manager.abort_write,
             payload_type=list[ObjectKey],
         )
         self._device_host_func_dispatcher.register(
@@ -943,6 +1080,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             confkv_gpu_crypto = create_confkv_gpu_crypto(
                 cache_context.device,
                 max_plaintext_len=max_plaintext_len,
+                num_slots=cache_context.max_batch_size,
             )
         except Exception:
             cache_context.close()
@@ -1145,16 +1283,50 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             total_bytes: int = 0
             store_succeeded = False
 
-            d2h_transform: Callable[[torch.Tensor, MemoryObj], None] | None = None
-            if confkv_gpu_crypto is not None:
-                def _seal_before_d2h(
-                    gpu_buffer: torch.Tensor, memory_obj: MemoryObj
-                ) -> None:
-                    confkv_gpu_crypto.seal_and_copy_d2h(
-                        gpu_buffer, memory_obj, stream=cache_context.stream
-                    )
+            d2h_transform: Callable[
+                [torch.Tensor, MemoryObj], None
+            ] | None = None
+            d2h_batch_transform: Callable[
+                [Sequence[torch.Tensor], Sequence[MemoryObj]], None
+            ] | None = None
 
-                d2h_transform = _seal_before_d2h
+            if confkv_gpu_crypto is not None:
+                if confkv_gpu_crypto.execution_mode == "naive":
+                    def _seal_before_d2h(
+                        gpu_buffer: torch.Tensor,
+                        memory_obj: MemoryObj,
+                    ) -> None:
+                        try:
+                            confkv_gpu_crypto.seal_and_copy_d2h(
+                                gpu_buffer,
+                                memory_obj,
+                                stream=cache_context.stream,
+                            )
+                        except Exception:
+                            confkv_gpu_crypto.quiesce_after_error(
+                                stream=cache_context.stream
+                            )
+                            raise
+
+                    d2h_transform = _seal_before_d2h
+                else:
+                    def _seal_batch_before_d2h(
+                        gpu_buffers: Sequence[torch.Tensor],
+                        memory_objs: Sequence[MemoryObj],
+                    ) -> None:
+                        try:
+                            confkv_gpu_crypto.seal_batch_and_copy_d2h(
+                                gpu_buffers,
+                                memory_objs,
+                                stream=cache_context.stream,
+                            )
+                        except Exception:
+                            confkv_gpu_crypto.quiesce_after_error(
+                                stream=cache_context.stream
+                            )
+                            raise
+
+                    d2h_batch_transform = _seal_batch_before_d2h
 
             try:
                 for obj_group_id in range(num_object_groups):
@@ -1190,10 +1362,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         block_ids_per_group_gpu,
                         memory_objs,
                         object_group_id=obj_group_id,
-                        batch_size=1,
+                        batch_size=(
+                            cache_context.max_batch_size
+                            if (
+                                confkv_gpu_crypto is not None
+                                and confkv_gpu_crypto.execution_mode
+                                == "optimized"
+                            )
+                            else 1
+                        ),
                         skip_first_n_tokens=0,
                         direction=lmc_ops.TransferDirection.D2H,
                         d2h_transform=d2h_transform,
+                        d2h_batch_transform=d2h_batch_transform,
                     )
 
                 store_succeeded = True
@@ -1212,7 +1393,21 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
                 else:
                     total_bytes = 0
-                num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
+                    if all_dict:
+                        # The callback runs after prior main-stream work.
+                        # Error transforms also quiesce every crypto stream
+                        # before this write-reserved memory can be freed.
+                        submit_callback_to_stream(
+                            cache_context.cupy_stream,
+                            "abort_write",
+                            list(all_dict.keys()),
+                        )
+
+                num_tokens = (
+                    num_chunks * self._ctx.chunk_size
+                    if stored_count
+                    else 0
+                )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
@@ -1363,16 +1558,50 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             total_bytes = 0
             retrieve_succeeded = True
 
-            h2d_transform: Callable[[MemoryObj, torch.Tensor], None] | None = None
-            if confkv_gpu_crypto is not None:
-                def _open_after_h2d(
-                    memory_obj: MemoryObj, gpu_buffer: torch.Tensor
-                ) -> None:
-                    confkv_gpu_crypto.copy_h2d_and_open(
-                        memory_obj, gpu_buffer, stream=cache_context.stream
-                    )
+            h2d_transform: Callable[
+                [MemoryObj, torch.Tensor], None
+            ] | None = None
+            h2d_batch_transform: Callable[
+                [Sequence[MemoryObj], Sequence[torch.Tensor]], None
+            ] | None = None
 
-                h2d_transform = _open_after_h2d
+            if confkv_gpu_crypto is not None:
+                if confkv_gpu_crypto.execution_mode == "naive":
+                    def _open_before_scatter(
+                        memory_obj: MemoryObj,
+                        gpu_buffer: torch.Tensor,
+                    ) -> None:
+                        try:
+                            confkv_gpu_crypto.copy_h2d_and_open(
+                                memory_obj,
+                                gpu_buffer,
+                                stream=cache_context.stream,
+                            )
+                        except Exception:
+                            confkv_gpu_crypto.quiesce_after_error(
+                                stream=cache_context.stream
+                            )
+                            raise
+
+                    h2d_transform = _open_before_scatter
+                else:
+                    def _open_batch_before_scatter(
+                        memory_objs: Sequence[MemoryObj],
+                        gpu_buffers: Sequence[torch.Tensor],
+                    ) -> None:
+                        try:
+                            confkv_gpu_crypto.copy_h2d_and_open_batch(
+                                memory_objs,
+                                gpu_buffers,
+                                stream=cache_context.stream,
+                            )
+                        except Exception:
+                            confkv_gpu_crypto.quiesce_after_error(
+                                stream=cache_context.stream
+                            )
+                            raise
+
+                    h2d_batch_transform = _open_batch_before_scatter
 
             try:
                 for obj_group_id in range(num_object_groups):
@@ -1392,10 +1621,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                             block_ids_per_group_gpu,
                             memory_objs,
                             object_group_id=obj_group_id,
-                            batch_size=cache_context.max_batch_size,
+                            batch_size=(
+                                1
+                                if (
+                                    confkv_gpu_crypto is not None
+                                    and confkv_gpu_crypto.execution_mode
+                                    == "naive"
+                                )
+                                else cache_context.max_batch_size
+                            ),
                             skip_first_n_tokens=skip_first_n_tokens,
                             direction=lmc_ops.TransferDirection.H2D,
                             h2d_transform=h2d_transform,
+                            h2d_batch_transform=h2d_batch_transform,
                         )
                         # Extend only after the copy is enqueued: on exception,
                         # read_prefetched_results releases this group's locks

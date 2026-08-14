@@ -10,6 +10,7 @@ from lmcache.v1.confkv.gpu_crypto import (
     FRAME_OVERHEAD,
     ConfKVAuthenticationError,
     ConfKVGpuCrypto,
+    confkv_gpu_execution_mode,
     create_confkv_gpu_crypto,
     layout_nbytes,
     persistent_layout_descs,
@@ -37,6 +38,39 @@ def test_disabled_factory_does_not_touch_cuda(monkeypatch):
         "cuda:0", max_plaintext_len=4096
     ) is None
 
+
+
+@pytest.mark.parametrize("mode", ["naive", "optimized"])
+def test_execution_mode(monkeypatch, mode):
+    monkeypatch.setenv("CONFKV_GPU_MODE", mode)
+    assert confkv_gpu_execution_mode() == mode
+
+
+def test_execution_mode_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("CONFKV_GPU_MODE", "fastest")
+    with pytest.raises(ValueError, match="CONFKV_GPU_MODE"):
+        confkv_gpu_execution_mode()
+
+
+def test_quiesce_after_error_synchronizes_main_and_slot_streams():
+    events: list[str] = []
+
+    class _Stream:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def synchronize(self) -> None:
+            events.append(self.name)
+
+    class _Slot:
+        def __init__(self, name: str) -> None:
+            self.stream = _Stream(name)
+
+    crypto = object.__new__(ConfKVGpuCrypto)
+    crypto._slots = [_Slot("slot0"), _Slot("slot1")]
+    crypto.quiesce_after_error(stream=_Stream("main"))
+
+    assert events == ["main", "slot0", "slot1"]
 
 
 def test_persistent_layout_descs_b3(monkeypatch):

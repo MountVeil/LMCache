@@ -252,6 +252,33 @@ class StorageManager:
 
         # TODO: global key states update
 
+    def abort_write(
+        self,
+        keys: list[ObjectKey],
+    ) -> None:
+        """Discard objects left write-locked by a failed GPU store.
+
+        Callers must invoke this only after all device operations that may
+        reference the reserved buffers have completed. The MP transfer path
+        satisfies that requirement by scheduling this method through its CUDA
+        host-function dispatcher on the transfer stream.
+        """
+        if not keys:
+            return
+
+        result = self._l1_manager.delete(keys, force=True)
+        failed = [
+            key
+            for key, error in result.items()
+            if error != L1Error.SUCCESS
+        ]
+        if failed:
+            logger.error(
+                "Failed to abort %d reserved L1 writes: %s",
+                len(failed),
+                failed,
+            )
+
     @contextmanager
     def read_prefetched_results(
         self,
