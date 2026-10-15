@@ -3,6 +3,11 @@
 from lmcache.v1.distributed.serde.aesgcm import (
     AesGcmDeserializer,
     AesGcmSerializer,
+    DirectAesGcmDeserializer,
+    DirectAesGcmSerializer,
+    ObjectPackGroup,
+    PackedObjectRange,
+    plan_uniform_object_packs,
 )
 from lmcache.v1.distributed.serde.async_processor import AsyncSerdeProcessor
 from lmcache.v1.distributed.serde.base import (
@@ -49,6 +54,8 @@ __all__ = [
     "AesGcmSerializer",
     "AsyncSerdeProcessor",
     "Deserializer",
+    "DirectAesGcmDeserializer",
+    "DirectAesGcmSerializer",
     "Fp8QuantizationDeserializer",
     "Fp8QuantizationSerializer",
     "HkdfKeyProvider",
@@ -57,6 +64,8 @@ __all__ = [
     "MemoryObjGroup",
     "MultiDeserializer",
     "MultiSerializer",
+    "ObjectPackGroup",
+    "PackedObjectRange",
     "SerdeConfig",
     "SerdeProcessor",
     "SerdeTaskId",
@@ -64,6 +73,7 @@ __all__ = [
     "create_serde_processor",
     "get_registered_serde_types",
     "make_temp_key",
+    "plan_uniform_object_packs",
     "register_serde_factory",
     "serialized_layout_desc",
     "TurboQuantDeserializer",
